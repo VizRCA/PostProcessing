@@ -306,7 +306,10 @@ namespace UnityEngine.Rendering.PostProcessing
         void BuildCommandBuffers()
         {
             var context = m_CurrentContext;
-            var sourceFormat = m_Camera.allowHDR ? RenderTextureFormat.DefaultHDR : RenderTextureFormat.Default;
+            var sourceFormat = m_Camera.allowHDR ? RuntimeUtilities.defaultHDRRenderTextureFormat : RenderTextureFormat.Default;
+
+            if (!RuntimeUtilities.isFloatingPointFormat(sourceFormat))
+                m_NaNKilled = true;
 
             context.Reset();
             context.camera = m_Camera;
@@ -321,6 +324,7 @@ namespace UnityEngine.Rendering.PostProcessing
             SetupContext(context);
 
             context.command = m_LegacyCmdBufferOpaque;
+            TextureLerper.instance.BeginFrame(context);
             UpdateSettingsIfNeeded(context);
 
             // Lighting & opaque-only effects
@@ -376,7 +380,7 @@ namespace UnityEngine.Rendering.PostProcessing
                 // on tiled GPU as it won't be able to resolve
                 int tempTarget0 = m_TargetPool.Get();
                 context.GetScreenSpaceTemporaryRT(cmd, tempTarget0, 0, sourceFormat);
-                cmd.Blit(cameraTarget, tempTarget0);
+                cmd.BuiltinBlit(cameraTarget, tempTarget0, RuntimeUtilities.copyStdMaterial, stopNaNPropagation ? 1 : 0);
                 context.source = tempTarget0;
 
                 int tempTarget1 = -1;
@@ -421,8 +425,9 @@ namespace UnityEngine.Rendering.PostProcessing
             // tiled GPUs
             int tempRt = m_TargetPool.Get();
             context.GetScreenSpaceTemporaryRT(m_LegacyCmdBuffer, tempRt, 0, sourceFormat, RenderTextureReadWrite.sRGB);
-            m_LegacyCmdBuffer.Blit(cameraTarget, tempRt, RuntimeUtilities.copyStdMaterial, stopNaNPropagation ? 1 : 0);
-            m_NaNKilled = stopNaNPropagation;
+            m_LegacyCmdBuffer.BuiltinBlit(cameraTarget, tempRt, RuntimeUtilities.copyStdMaterial, stopNaNPropagation ? 1 : 0);
+            if (!m_NaNKilled)
+                m_NaNKilled = stopNaNPropagation;
 
             context.command = m_LegacyCmdBuffer;
             context.source = tempRt;
@@ -577,7 +582,7 @@ namespace UnityEngine.Rendering.PostProcessing
             if (m_SettingsUpdateNeeded)
             {
                 context.command.BeginSample("VolumeBlending");
-                PostProcessManager.instance.UpdateSettings(this);
+                PostProcessManager.instance.UpdateSettings(this, context.camera);
                 context.command.EndSample("VolumeBlending");
                 m_TargetPool.Reset();
 
@@ -778,6 +783,19 @@ namespace UnityEngine.Rendering.PostProcessing
             cmd.EndSample(marker);
         }
 
+        void ApplyFlip(PostProcessRenderContext context, MaterialPropertyBlock properties)
+        {
+            if (context.flip && !context.isSceneView)
+                properties.SetVector(ShaderIDs.UVTransform, new Vector4(1.0f, 1.0f, 0.0f, 0.0f));
+            else
+                ApplyDefaultFlip(properties);
+        }
+
+        void ApplyDefaultFlip(MaterialPropertyBlock properties)
+        {
+            properties.SetVector(ShaderIDs.UVTransform, SystemInfo.graphicsUVStartsAtTop ? new Vector4(1.0f, -1.0f, 0.0f, 1.0f) : new Vector4(1.0f, 1.0f, 0.0f, 0.0f));
+        }
+
         int RenderBuiltins(PostProcessRenderContext context, bool isFinalPass, int releaseTargetAfterUse = -1)
         {
             var uberSheet = context.propertySheets.Get(context.resources.shaders.uber);
@@ -822,6 +840,7 @@ namespace UnityEngine.Rendering.PostProcessing
             RenderEffect<AutoExposure>(context);
             uberSheet.properties.SetTexture(ShaderIDs.AutoExposureTex, context.autoExposureTexture);
 
+            RenderEffect<LensDistortion>(context);
             RenderEffect<ChromaticAberration>(context);
             RenderEffect<Bloom>(context);
             RenderEffect<Vignette>(context);
@@ -830,18 +849,18 @@ namespace UnityEngine.Rendering.PostProcessing
             if (!breakBeforeColorGrading)
                 RenderEffect<ColorGrading>(context);
 
-            int pass = 0;
-
             if (isFinalPass)
             {
                 uberSheet.EnableKeyword("FINALPASS");
                 dithering.Render(context);
-
-                if (context.flip && !context.isSceneView)
-                    pass = 1;
+                ApplyFlip(context, uberSheet.properties);
+            }
+            else
+            {
+                ApplyDefaultFlip(uberSheet.properties);
             }
 
-            cmd.BlitFullscreenTriangle(context.source, context.destination, uberSheet, pass);
+            cmd.BlitFullscreenTriangle(context.source, context.destination, uberSheet, 0);
 
             context.source = context.destination;
             context.destination = finalDestination;
@@ -898,7 +917,8 @@ namespace UnityEngine.Rendering.PostProcessing
 
                 dithering.Render(context);
 
-                cmd.BlitFullscreenTriangle(context.source, context.destination, uberSheet, (context.flip && !context.isSceneView) ? 1 : 0);
+                ApplyFlip(context, uberSheet.properties);
+                cmd.BlitFullscreenTriangle(context.source, context.destination, uberSheet, 0);
 
                 if (tempTarget > -1)
                     cmd.ReleaseTemporaryRT(tempTarget);
@@ -940,7 +960,7 @@ namespace UnityEngine.Rendering.PostProcessing
         bool ShouldGenerateLogHistogram(PostProcessRenderContext context)
         {
             bool autoExpo = GetBundle<AutoExposure>().settings.IsEnabledAndSupported(context);
-            bool lightMeter = debugLayer.lightMeter.IsRequestedAndSupported();
+            bool lightMeter = debugLayer.lightMeter.IsRequestedAndSupported(context);
             return autoExpo || lightMeter;
         }
     }
